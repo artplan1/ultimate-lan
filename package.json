@@ -1,0 +1,13 @@
+{
+  "name": "ultimate-lan",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "check": "node --check server.ts && node --check config.ts && node --check lan.ts && node --check projects.ts",
+    "test": "node --experimental-test-module-mocks --test test/*.test.ts"
+  },
+  "engines": {
+    "node": ">=26"
+  }
+}
