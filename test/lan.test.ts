@@ -14,10 +14,11 @@ import type { Config, Project } from '../config.ts'
 const clone = process.env.ULTIMATE_ROOT
 if (!clone) throw new Error('Set ULTIMATE_ROOT to the existing Ultimate checkout')
 const { admit } = await import(pathToFileURL(join(clone, 'server/request-security.ts')).href)
-let gateway: http.Server
+const listeners = new Map<string, http.Server>()
+let binds: [number, string][] = []
 let peer = '10.20.30.2'
 let failListen = false
-let requestedBind: unknown[]
+let failBind: string | undefined
 let created = 0
 let beforeRead: (() => Promise<void>) | undefined
 mock.module('node:fs/promises', {
@@ -40,16 +41,23 @@ mock.module('node:http', {
       })
       const listen = server.listen.bind(server)
       server.listen = ((port: number, address: string, callback: () => void) => {
-        requestedBind = [port, address]
-        if (failListen) {
+        binds.push([port, address])
+        if (failListen || failBind === address) {
           queueMicrotask(() =>
-            server.emit('error', Object.assign(new Error('occupied'), { code: 'EADDRINUSE' })),
+            server.emit(
+              'error',
+              Object.assign(new Error('unavailable'), {
+                code: failBind === address ? 'EADDRNOTAVAIL' : 'EADDRINUSE',
+              }),
+            ),
           )
           return server
         }
-        return listen(0, '127.0.0.1', callback)
+        return listen(0, '127.0.0.1', () => {
+          listeners.set(address, server)
+          callback()
+        })
       }) as typeof server.listen
-      gateway = server
       return server
     },
   },
@@ -57,9 +65,13 @@ mock.module('node:http', {
 const { installLan } = await import('../lan.ts')
 const { ordinary } = await import('../config.ts')
 
-async function fixture(proxyOnly = false) {
+async function fixture(proxyOnly = false, tailnet = false) {
   peer = '10.20.30.2'
   failListen = false
+  failBind = undefined
+  created = 0
+  listeners.clear()
+  binds = []
   const userHome = await mkdtemp(join(tmpdir(), 'ultimate-lan-test-'))
   const root = '/workspace/project-a'
   const home = join(
@@ -78,6 +90,7 @@ async function fixture(proxyOnly = false) {
       hostname: 'lan.example.org',
       projects: [{ home, gatewayPort: 4752, httpsPort: 8444 }],
     }
+  if (tailnet) config.tailscale = { address: '100.64.0.9', peers: ['100.64.0.9', '100.64.0.10'] }
   await mkdir(join(userHome, '.ultimate'))
   const settings = (lan: unknown) =>
     writeFile(join(userHome, '.ultimate/settings.json'), JSON.stringify({ lan }))
@@ -138,15 +151,22 @@ async function fixture(proxyOnly = false) {
     },
   }
   installLan(host)
-  const wire = (options: http.RequestOptions = {}, body?: Buffer) =>
+  const wire = (options: http.RequestOptions = {}, body?: Buffer, at = config.address) =>
     new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const target = listeners.get(at)
+      if (!target?.listening) {
+        reject(new Error(`${at} ingress is not listening`))
+        return
+      }
       const req = http.request(
         {
           hostname: '127.0.0.1',
-          port: (gateway.address() as AddressInfo).port,
+          port: (target.address() as AddressInfo).port,
           ...options,
           headers: {
-            host: proxyOnly ? 'lan.example.org:8444' : '10.20.30.1:4751',
+            ...(at === config.address
+              ? { host: proxyOnly ? 'lan.example.org:8444' : '10.20.30.1:4751' }
+              : {}),
             ...options.headers,
           },
           agent: false,
@@ -173,6 +193,8 @@ async function fixture(proxyOnly = false) {
     release,
     close,
     wire,
+    binds: () => binds,
+    listener: (address: string) => listeners.get(address),
     dispose: async () => {
       await close()
       upstream.closeAllConnections()
@@ -186,8 +208,8 @@ test('existing direct HTTP, streaming, core admission and lifecycle remain funct
   const f = await fixture()
   try {
     await f.open()
-    assert.deepEqual(requestedBind, [4751, '10.20.30.1'])
-    assert.equal((gateway.address() as AddressInfo).address, '127.0.0.1')
+    assert.deepEqual(f.binds(), [[4751, '10.20.30.1']])
+    assert.equal((f.listener('10.20.30.1')!.address() as AddressInfo).address, '127.0.0.1')
     assert.deepEqual(
       await f.wire(
         {
@@ -236,7 +258,7 @@ test('existing direct HTTP, streaming, core admission and lifecycle remain funct
       const req = http.get(
         {
           hostname: '127.0.0.1',
-          port: (gateway.address() as AddressInfo).port,
+          port: (f.listener('10.20.30.1')!.address() as AddressInfo).port,
           path: '/events',
           headers: { host: '10.20.30.1:4751' },
           agent: false,
@@ -253,8 +275,8 @@ test('existing direct HTTP, streaming, core admission and lifecycle remain funct
     )
     const raw = []
     for (const partial of [false, true]) {
-      const accepted = once(gateway, 'connection')
-      const socket = connect((gateway.address() as AddressInfo).port, '127.0.0.1')
+      const accepted = once(f.listener('10.20.30.1')!, 'connection')
+      const socket = connect((f.listener('10.20.30.1')!.address() as AddressInfo).port, '127.0.0.1')
       const [acceptedSocket] = await accepted
       // Forced release may reset an incomplete request; both sockets must still close.
       socket.on('error', (error: NodeJS.ErrnoException) => assert.equal(error.code, 'ECONNRESET'))
@@ -273,7 +295,7 @@ test('existing direct HTTP, streaming, core admission and lifecycle remain funct
     await ended
     await Promise.all(raw)
     assert.equal(f.rules.size, 0)
-    assert.equal(gateway.listening, false)
+    assert.equal(f.listener('10.20.30.1')!.listening, false)
     await f.release()
     await f.close()
     await f.open()
@@ -291,7 +313,7 @@ test('HTTPS ingress requires the real proxy peer and exact public authority; no 
   const f = await fixture(true)
   try {
     await f.open()
-    assert.deepEqual(requestedBind, [4752, '10.20.30.1'])
+    assert.deepEqual(f.binds(), [[4752, '10.20.30.1']])
     assert.deepEqual(
       [...f.rules].map((rule) => rule.origin),
       ['https://lan.example.org:8444'],
@@ -362,6 +384,188 @@ test('owner retains HTTP while also admitting its exact proxy HTTPS origin', asy
   }
 })
 
+test('Tailscale ingress admits only the configured exact peers and authority, keeping the proxy route', async () => {
+  const f = await fixture(true, true)
+  try {
+    await f.open()
+    assert.deepEqual(f.binds(), [
+      [4752, '10.20.30.1'],
+      [4752, '100.64.0.9'],
+    ])
+    assert.deepEqual(
+      [...f.rules].map((rule) => rule.origin).sort(),
+      ['http://100.64.0.9:4752', 'https://lan.example.org:8444'],
+    )
+    const tail = '100.64.0.9'
+    // A tailnet peer outside the allowlist, and the proxy peer itself, are refused on the tailnet transport.
+    for (const denied of ['100.64.0.11', '10.20.30.4']) {
+      peer = denied
+      assert.equal((await f.wire({ headers: { host: '100.64.0.9:4752' } }, undefined, tail)).status, 403, denied)
+    }
+    peer = '100.64.0.10'
+    assert.equal(
+      (
+        await f.wire(
+          {
+            headers: {
+              host: '100.64.0.9:4752',
+              origin: 'http://100.64.0.9:4752',
+              'sec-fetch-site': 'same-origin',
+            },
+          },
+          undefined,
+          tail,
+        )
+      ).status,
+      201,
+    )
+    // Any other authority on that listener fails closed, including the LAN and proxy authorities.
+    for (const host of ['100.64.0.9:4751', '10.20.30.1:4752', 'lan.example.org:8444', 'localhost:4750'])
+      assert.equal((await f.wire({ headers: { host } }, undefined, tail)).status, 403, host)
+    // Malformed authority/origin a browser never sends: Node keeps only the first Host value, so a repeated one,
+    // and a present-but-empty Origin the core reads as absent, are refused before anything is forwarded.
+    const raw = (lines: string) =>
+      new Promise<string>((resolve, reject) => {
+        const socket = connect(
+          (f.listener(tail)!.address() as AddressInfo).port,
+          '127.0.0.1',
+        )
+        let out = ''
+        socket.on('data', (chunk) => (out += chunk))
+        socket.on('error', reject)
+        socket.on('close', () => resolve(out.split('\r\n')[0]!))
+        socket.write(lines)
+      })
+    assert.match(
+      await raw(
+        'GET /api/action HTTP/1.1\r\nHost: 100.64.0.9:4752\r\nHost: evil.invalid\r\nConnection: close\r\n\r\n',
+      ),
+      / 400 /,
+    )
+    assert.match(
+      await raw(
+        'GET /api/action HTTP/1.1\r\nHost: 100.64.0.9:4752\r\nOrigin: \r\nConnection: close\r\n\r\n',
+      ),
+      / 400 /,
+    )
+    // The same request without a repeated Host or an empty Origin reaches the project.
+    assert.match(
+      await raw('GET /api/action HTTP/1.1\r\nHost: 100.64.0.9:4752\r\nConnection: close\r\n\r\n'),
+      / 201 /,
+    )
+    // Node rejects a request past 1000 header pairs with 431 instead of passing a truncated list, so at the largest
+    // request this handler can receive the repeated Host must still be seen: 997 fillers reach it, 998 do not.
+    const filler = (count: number) =>
+      Array.from({ length: count }, (_, index) => `x${index}:1\r\n`).join('')
+    assert.match(
+      await raw(
+        `GET /api/action HTTP/1.1\r\nHost: 100.64.0.9:4752\r\n${filler(997)}Host: evil.invalid\r\nConnection: close\r\n\r\n`,
+      ),
+      / 400 /,
+    )
+    assert.match(
+      await raw(
+        `GET /api/action HTTP/1.1\r\nHost: 100.64.0.9:4752\r\n${filler(998)}Host: evil.invalid\r\nConnection: close\r\n\r\n`,
+      ),
+      / 431 /,
+    )
+    // The core's own admission still applies: a foreign origin or cross-site request never reaches a project.
+    for (const headers of [
+      { host: '100.64.0.9:4752', origin: 'http://evil.invalid' },
+      { host: '100.64.0.9:4752', 'sec-fetch-site': 'cross-site' },
+    ])
+      assert.equal((await f.wire({ headers }, undefined, tail)).status, 403)
+    // Forged identity and forwarding headers are stripped, and the hop proof is this process's own token.
+    assert.equal(
+      (
+        await f.wire(
+          {
+            headers: {
+              host: '100.64.0.9:4752',
+              origin: 'http://100.64.0.9:4752',
+              'sec-fetch-site': 'same-origin',
+              'tailscale-user-login': 'forged',
+              forwarded: 'for=127.0.0.1',
+              'x-ultimate-lan-token': 'forged',
+            },
+          },
+          undefined,
+          tail,
+        )
+      ).status,
+      201,
+    )
+    const headers = f.seen.at(-1)!
+    assert.equal(headers['tailscale-user-login'], undefined)
+    assert.equal(headers.forwarded, undefined)
+    assert.equal(headers['x-forwarded-for'], '100.64.0.10')
+    assert.notEqual(headers['x-ultimate-lan-token'], 'forged')
+    // The published proxy route is unaffected by the tailnet transport.
+    peer = '10.20.30.4'
+    assert.equal(
+      (
+        await f.wire({
+          headers: { host: 'lan.example.org:8444', origin: 'https://lan.example.org:8444' },
+        })
+      ).status,
+      201,
+    )
+    await f.release()
+    assert.equal(f.rules.size, 0)
+    assert.equal(f.listener('10.20.30.1')!.listening, false)
+    assert.equal(f.listener('100.64.0.9')!.listening, false)
+  } finally {
+    await f.dispose()
+  }
+})
+
+test('an absent Tailscale address leaves both prior routes of the owner untouched and recovers on reopen', async () => {
+  // The owner also serves the plaintext LAN fallback and the proxy, so a failed tailnet bind must not cost either.
+  const f = await fixture()
+  try {
+    f.config.proxy = {
+      address: '10.20.30.4',
+      hostname: 'lan.example.org',
+      projects: [{ home: f.host.home, gatewayPort: 4751, httpsPort: 8443 }],
+    }
+    f.config.tailscale = { address: '100.64.0.9', peers: ['100.64.0.9', '100.64.0.10'] }
+    await f.settings(f.config)
+    failBind = '100.64.0.9'
+    await f.open()
+    assert.deepEqual(f.binds(), [
+      [4751, '10.20.30.1'],
+      [4751, '100.64.0.9'],
+    ])
+    assert.deepEqual(
+      [...f.rules].map((rule) => rule.origin).sort(),
+      ['http://10.20.30.1:4751', 'https://lan.example.org:8443'],
+    )
+    assert.equal(f.listener('100.64.0.9'), undefined)
+    assert.equal((await f.wire()).status, 201)
+    peer = '10.20.30.4'
+    assert.equal(
+      (
+        await f.wire({
+          headers: { host: 'lan.example.org:8443', origin: 'https://lan.example.org:8443' },
+        })
+      ).status,
+      201,
+    )
+    await f.release()
+    assert.equal(f.rules.size, 0)
+    failBind = undefined
+    await f.open()
+    assert.deepEqual(
+      [...f.rules].map((rule) => rule.origin).sort(),
+      ['http://10.20.30.1:4751', 'http://100.64.0.9:4751', 'https://lan.example.org:8443'],
+    )
+    assert.equal(f.listener('100.64.0.9')!.listening, true)
+  } finally {
+    failBind = undefined
+    await f.dispose()
+  }
+})
+
 test('settings/mapping errors, preview homes and occupied binds fail closed', async () => {
   const f = await fixture(true)
   try {
@@ -386,11 +590,30 @@ test('settings/mapping errors, preview homes and occupied binds fail closed', as
     assert.equal(f.rules.size, 0)
     f.host.home = ordinaryHome
     f.config.proxy!.projects[0]!.home = ordinaryHome
+    for (const tailscale of [
+      'yes',
+      { address: '10.20.30.1', peers: ['100.64.0.9'] },
+      { address: '100.64.0.9', peers: [] },
+      { address: '100.64.0.9', peers: ['100.64.0.10'] },
+      { address: '100.64.0.9', peers: ['100.64.0.9', '100.64.0.9'] },
+      { address: '100.64.0.9', peers: ['100.64.0.9', '10.20.30.9'] },
+    ]) {
+      await f.settings({ ...f.config, tailscale })
+      await assert.rejects(f.open(), /tailscale|Tailscale/, JSON.stringify(tailscale))
+    }
+    // The port map comes from the proxy targets, so a tailnet transport without one is refused.
+    await f.settings({
+      home: f.config.home,
+      address: f.config.address,
+      port: f.config.port,
+      tailscale: { address: '100.64.0.9', peers: ['100.64.0.9'] },
+    })
+    await assert.rejects(f.open(), /per-project port map/)
     await f.settings(f.config)
     failListen = true
     await assert.rejects(f.open(), /Cannot open LAN gateway/)
     assert.equal(f.rules.size, 0)
-    assert.equal(gateway.listening, false)
+    assert.equal(f.listener('10.20.30.1'), undefined)
     const worktreeRoot = '/workspace/.ultimate/projects/main-12345678/worktrees/42'
     assert.equal(
       ordinary(

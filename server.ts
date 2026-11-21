@@ -6,9 +6,12 @@ import { listProjects } from './projects.ts'
 export const reloadOnSettings = true
 export const pollActions = ['projects']
 
+const originOf = (args: unknown) =>
+  typeof args === 'object' && args !== null ? (args as { origin?: unknown }).origin : undefined
+
 export const actions = {
-  projects: (_args: unknown, { host, signal }: { host: Host; signal: AbortSignal }) =>
-    listProjects(host, signal),
+  projects: (args: unknown, { host, signal }: { host: Host; signal: AbortSignal }) =>
+    listProjects(host, signal, originOf(args)),
 }
 
 export default function lan(host: Host) {

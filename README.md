@@ -31,6 +31,10 @@ Merge `lan` into **user-level** `~/.ultimate/settings.json`, preserving other ke
         { "home": "/absolute/coordinator-state-home", "gatewayPort": 4751, "httpsPort": 8443 },
         { "home": "/absolute/another-project-state-home", "gatewayPort": 4752, "httpsPort": 8444 }
       ]
+    },
+    "tailscale": {
+      "address": "100.64.0.9",
+      "peers": ["100.64.0.9", "100.64.0.10"]
     }
   }
 }
@@ -39,6 +43,8 @@ Merge `lan` into **user-level** `~/.ultimate/settings.json`, preserving other ke
 Only mapped ordinary default homes open HTTPS gateways; custom/preview/worktree homes do not. Ports and homes must be unique. Stopped projects remain stopped. Each process forwards only to its own loopback supervisor. Labels are optional; `port` defaults to 4751. The coordinator's gateway must use that fallback port.
 
 The coordinator also keeps plaintext `http://192.168.1.10:4751/` access from its /24. Omit `proxy` for HTTP-only mode; it cannot provide secure-context PWA/push features. Other mapped gateways admit only the designated proxy peer and exact public Host, including its port. Origin and Fetch Metadata still pass through Ultimate's core admission. Forged identity/forwarding headers are removed; a private process-local hop proof is not user authentication. Release/unload revokes admission and closes streams, including SSE.
+
+`tailscale` adds one plaintext HTTP listener per running mapped project on this host's own Tailscale address, at the same per-project `gatewayPort` the targets already give it (the coordinator uses `port`). Each admits only the exact configured peer addresses and the exact `Host: <address>:<port>`, and refuses a repeated or empty Host/Origin outright; a peer outside the allowlist, a different authority, or a missing Tailscale address fails closed without touching the LAN or proxy routes. The list must include `address` itself: the host is a client of its own address, and its readiness probes come from it. This gives those peers a single base — the same scheme and host, one port per project — so the same-tab menu can switch between them without leaving that base or opening an installed app. It also gives them reads and agent actions in every mapped project, exactly as the HTTPS gateways already do; plaintext HTTP is not a secure context, so no PWA, service worker or push on those origins.
 
 ## Reverse-proxy contract
 
@@ -52,7 +58,7 @@ The proxy must share the gateway's /24 and appear as the configured peer. Confir
 
 ## Menu, PWA and push
 
-Remote pages show ready links, the current project, and disabled Offline / Not ready / Not published rows. Readiness verifies trusted TLS and the intended project's initial SSE identity, not just a live process. This does not prove a phone's DNS/network path. Loopback UI stays unchanged.
+Remote pages show ready links, the current project, and disabled Offline / Not ready / Not published rows. Links keep the page's own scheme and host and change only the port of the project they open, so a page opened on a plaintext base never jumps to HTTPS. The current row does not navigate. On the coordinator's plaintext LAN base only the current project is admitted, so the other rows read HTTPS only; the Tailscale base reaches every running mapped project. Readiness verifies the intended project's initial SSE identity on the same transport the link uses, not just a live process. This does not prove a phone's DNS/network path. Loopback UI stays unchanged.
 
 Each HTTPS port has separate origin storage, service worker, installed app and push subscription. Switching projects can leave an installed app for the browser. Install and enable notifications separately for desired origins; verify background delivery and notification tap on the actual phone. Cookies are **not** isolated by port.
 

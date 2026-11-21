@@ -169,7 +169,7 @@ test('readiness verifies real TLS trust, authority and bounded SSE identity; men
       home: project.home,
       projects: async () => [project, offline, unpublished, preview],
     } as Host
-    const choices = await listProjects(host, cancelled.signal)
+    const choices = await listProjects(host, cancelled.signal, `https://lan.example.org:${target.httpsPort}`)
     assert.deepEqual(
       choices.map((p) => [p.name, p.state, p.href]),
       [

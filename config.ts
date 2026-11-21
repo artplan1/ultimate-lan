@@ -24,11 +24,18 @@ export interface Proxy {
   projects: Target[]
 }
 
+/** Plain HTTP on this host's own tailnet address, admitted by exact peers; the ports are the proxy targets'. */
+export interface Tailscale {
+  address: string
+  peers: string[]
+}
+
 export interface Config {
   home: string
   address: string
   port: number
   proxy?: Proxy
+  tailscale?: Tailscale
 }
 
 export function sameSubnet(peer: string | undefined, address: string) {
@@ -43,6 +50,13 @@ function privateAddress(address: unknown): address is string {
   if (typeof address !== 'string' || !isIPv4(address)) return false
   const [a, b] = address.split('.').map(Number)
   return a === 10 || (a === 172 && b! >= 16 && b! <= 31) || (a === 192 && b === 168)
+}
+
+/** Tailscale hands each node one address from the carrier-grade NAT range. */
+function tailnet(address: unknown): address is string {
+  if (typeof address !== 'string' || !isIPv4(address)) return false
+  const [a, b] = address.split('.').map(Number)
+  return a === 100 && b! >= 64 && b! <= 127
 }
 
 function port(value: unknown): value is number {
@@ -117,6 +131,26 @@ export async function readConfig(userHome: string): Promise<Config | undefined> 
       gateways.add(target.gatewayPort)
       https.add(target.httpsPort)
     }
+  }
+  const tailscale = config.tailscale
+  if (tailscale !== undefined) {
+    if (!tailscale || typeof tailscale !== 'object')
+      throw new Error('lan.tailscale must be an object')
+    if (!tailnet(tailscale.address))
+      throw new Error('lan.tailscale.address must be this host\'s Tailscale IPv4 address')
+    if (!Array.isArray(tailscale.peers) || tailscale.peers.length === 0)
+      throw new Error('lan.tailscale.peers must be an explicit allowlist of Tailscale IPv4 addresses')
+    const peers = new Set<string>()
+    for (const peer of tailscale.peers) {
+      if (!tailnet(peer))
+        throw new Error('lan.tailscale.peers must contain Tailscale IPv4 addresses only')
+      if (peers.has(peer)) throw new Error('LAN Tailscale peers must be unique')
+      peers.add(peer)
+    }
+    // The host itself is a client of its own tailnet address, and every probe of another project comes from it.
+    if (!peers.has(tailscale.address))
+      throw new Error('lan.tailscale.peers must include lan.tailscale.address')
+    if (!proxy) throw new Error('lan.tailscale needs lan.proxy for the per-project port map')
   }
   return config
 }
